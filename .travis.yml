@@ -1,0 +1,5 @@
+os: osx
+osx_image: xcode11.3
+language: cpp
+script: cmake -B build -DUSE_NETTLE=1 && cd build && make && ./tests
+
