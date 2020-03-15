@@ -235,31 +235,33 @@ int stun_write(void *buf, size_t size, const stun_message_t *msg, const char *pa
 		goto overflow;
 	pos += len;
 
-	if (*msg->credentials.username != '\0') {
+	if (msg->msg_class == STUN_CLASS_REQUEST && *msg->credentials.username != '\0') {
 		len = stun_write_attr(pos, end - pos, STUN_ATTR_USERNAME, msg->credentials.username,
 		                      strlen(msg->credentials.username));
 		if (len <= 0)
 			goto overflow;
 		pos += len;
 	}
-	if (*msg->credentials.realm != '\0') {
-		len = stun_write_attr(pos, end - pos, STUN_ATTR_REALM, msg->credentials.realm,
-		                      strlen(msg->credentials.realm));
-		if (len <= 0)
-			goto overflow;
-		pos += len;
+	if (msg->msg_class == STUN_CLASS_REQUEST || msg->msg_method == STUN_METHOD_ALLOCATE) {
+		if (*msg->credentials.realm != '\0') {
+			len = stun_write_attr(pos, end - pos, STUN_ATTR_REALM, msg->credentials.realm,
+			                      strlen(msg->credentials.realm));
+			if (len <= 0)
+				goto overflow;
+			pos += len;
+		}
+		if (*msg->credentials.nonce != '\0') {
+			len = stun_write_attr(pos, end - pos, STUN_ATTR_NONCE, msg->credentials.nonce,
+			                      strlen(msg->credentials.nonce));
+			if (len <= 0)
+				goto overflow;
+			pos += len;
+		}
 	}
-	if (*msg->credentials.nonce != '\0') {
-		len = stun_write_attr(pos, end - pos, STUN_ATTR_NONCE, msg->credentials.nonce,
-		                      strlen(msg->credentials.nonce));
-		if (len <= 0)
-			goto overflow;
-		pos += len;
-	}
-	if (password) {
+	if (msg->msg_class != STUN_CLASS_INDICATION && password) {
 		// According to RFC 8489, the agent must include both MESSAGE-INTEGRITY and
-		// MESSAGE-INTEGRITY-SHA256. However, this make older servers fail with error 420 Unknown
-		// Attribute. Therefore, only MESSAGE-INTEGRITY is included in the message for
+		// MESSAGE-INTEGRITY-SHA256. However, this make legacy agents and servers fail with error
+		// 420 Unknown Attribute. Therefore, only MESSAGE-INTEGRITY is included in the message for
 		// compatibility.
 		size_t tmp_length = pos - attr_begin + STUN_ATTR_SIZE + HMAC_SHA1_SIZE;
 		stun_update_header_length(begin, tmp_length);
@@ -866,6 +868,6 @@ JUICE_EXPORT int _juice_stun_read(void *data, size_t size, stun_message_t *msg) 
 }
 
 JUICE_EXPORT bool _juice_stun_check_integrity(void *buf, size_t size, const stun_message_t *msg,
-                                             const char *password) {
+                                              const char *password) {
 	return stun_check_integrity(buf, size, msg, password);
 }

@@ -39,6 +39,12 @@
 #include <windows.h>
 #endif
 
+// RFC 8656: The Permission Lifetime MUST be 300 seconds (= 5 minutes)
+#define PERMISSION_LIFETIME 300000 // ms
+
+// RFC 8656: Channel bindings last for 10 minutes unless refreshed
+#define BIND_LIFETIME 600000 // ms
+
 #define BUFFER_SIZE 4096
 #define DEFAULT_MAX_RECORDS_COUNT 8
 
@@ -127,7 +133,10 @@ void agent_do_destroy(juice_agent_t *agent) {
 	// Free credentials in entries
 	for (int i = 0; i < agent->entries_count; ++i) {
 		agent_stun_entry_t *entry = agent->entries + i;
-		free(entry->turn);
+		if (entry->turn) {
+			turn_destroy_map(&entry->turn->map);
+			free(entry->turn);
+		}
 	}
 
 	// Free strings in config
@@ -139,8 +148,6 @@ void agent_do_destroy(juice_agent_t *agent) {
 		free((void *)stun_server->password);
 	}
 	free(agent->config.turn_servers);
-
-	// Enventually free the agent
 	free(agent);
 
 #ifdef _WIN32
@@ -370,8 +377,8 @@ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
 	return agent_direct_send(agent, &selected_entry->record, data, size, ds);
 }
 
-int agent_direct_send(juice_agent_t *agent, const addr_record_t *record, const char *data,
-                      size_t size, int ds) {
+int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
+                      int ds) {
 	mutex_lock(&agent->send_mutex);
 
 	if (agent->send_ds >= 0 && agent->send_ds != ds) {
@@ -385,12 +392,11 @@ int agent_direct_send(juice_agent_t *agent, const addr_record_t *record, const c
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
 #if defined(_WIN32) || defined(__APPLE__)
-	addr_record_t tmp = *record;
+	addr_record_t tmp = *dst;
 	addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
-	int ret = sendto(agent->sock, data, (int)size, 0, (struct sockaddr *)&tmp.addr, (int)tmp.len);
+	int ret = sendto(agent->sock, data, (int)size, 0, (const struct sockaddr *)&tmp.addr, tmp.len);
 #else
-	int ret =
-	    sendto(agent->sock, data, size, 0, (const struct sockaddr *)&record->addr, record->len);
+	int ret = sendto(agent->sock, data, size, 0, (const struct sockaddr *)&dst->addr, dst->len);
 #endif
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Send failed, errno=%d", sockerrno);
@@ -399,7 +405,7 @@ int agent_direct_send(juice_agent_t *agent, const addr_record_t *record, const c
 	return ret;
 }
 
-int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *record,
+int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
                      const char *data, size_t size, int ds) {
 	if (!entry->turn) {
 		JLOG_ERROR("Missing TURN state on relay entry");
@@ -409,8 +415,8 @@ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr
 	JLOG_VERBOSE("Sending datagram via relay, size=%d", size);
 
 	// Send CreatePermission if necessary
-	if (!turn_has_permission(entry->turn, record))
-		if (agent_send_turn_create_permission_request(agent, entry, record, ds))
+	if (!turn_has_permission(&entry->turn->map, dst))
+		if (agent_send_turn_create_permission_request(agent, entry, dst, ds))
 			return -1;
 
 	// Send the data in a TURN Send indication
@@ -419,7 +425,7 @@ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr
 	msg.msg_class = STUN_CLASS_INDICATION;
 	msg.msg_method = STUN_METHOD_SEND;
 	juice_random(msg.transaction_id, STUN_TRANSACTION_ID_SIZE);
-	msg.peer = *record;
+	msg.peer = *dst;
 	msg.data = data;
 	msg.data_size = size;
 	msg.dont_fragment = true;
@@ -444,16 +450,13 @@ int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const ad
 		return -1;
 	}
 
-	uint16_t channel;
-	if (!turn_get_channel(entry->turn, record, &channel))
-		return -1;
-
-	JLOG_VERBOSE("Sending datagram via channel 0x%hX, size=%d", channel, size);
-
 	// Send ChannelBind if necessary
-	if (!turn_has_bind(entry->turn, record))
+	uint16_t channel;
+	if (!turn_get_bound_channel(&entry->turn->map, record, &channel))
 		if (agent_send_turn_channel_bind_request(agent, entry, record, ds))
 			return -1;
+
+	JLOG_VERBOSE("Sending datagram via channel 0x%hX, size=%d", channel, size);
 
 	// Send the data wrapped as ChannelData
 	char buffer[BUFFER_SIZE];
@@ -540,9 +543,13 @@ void agent_run(juice_agent_t *agent) {
 					entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
 					entry->pair = NULL;
 					entry->record = *record;
-					entry->turn = calloc(1, sizeof(turn_state_t));
+					entry->turn = calloc(1, sizeof(agent_turn_state_t));
 					if (!entry->turn) {
 						JLOG_ERROR("calloc for TURN state failed");
+						break;
+					}
+					if (turn_init_map(&entry->turn->map, AGENT_TURN_MAP_SIZE) < 0) {
+						free(entry->turn);
 						break;
 					}
 					snprintf(entry->turn->credentials.username, STUN_MAX_USERNAME_LEN, "%s",
@@ -684,22 +691,22 @@ int agent_recv(juice_agent_t *agent) {
 	return 0;
 }
 
-int agent_input(juice_agent_t *agent, char *buffer, size_t len, const addr_record_t *source,
+int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t *src,
                 const addr_record_t *relayed) {
 	JLOG_VERBOSE("Received datagram, size=%d", len);
 
-	if (is_stun_datagram(buffer, len)) {
+	if (is_stun_datagram(buf, len)) {
 		JLOG_DEBUG("Received STUN datagram%s", relayed ? " via relay" : "");
 		stun_message_t msg;
-		if (stun_read(buffer, len, &msg) < 0) {
+		if (stun_read(buf, len, &msg) < 0) {
 			JLOG_ERROR("STUN message reading failed");
 			return -1;
 		}
-		return agent_dispatch_stun(agent, buffer, len, &msg, source, relayed);
+		return agent_dispatch_stun(agent, buf, len, &msg, src, relayed);
 	}
 
 	JLOG_DEBUG("Received non-STUN datagram%s", relayed ? " via relay" : "");
-	agent_stun_entry_t *entry = agent_find_entry_from_record(agent, source, relayed);
+	agent_stun_entry_t *entry = agent_find_entry_from_record(agent, src, relayed);
 	if (!entry) {
 		JLOG_WARN("Received a datagram from unknown address, ignoring");
 		return -1;
@@ -708,13 +715,13 @@ int agent_input(juice_agent_t *agent, char *buffer, size_t len, const addr_recor
 	case AGENT_STUN_ENTRY_TYPE_CHECK:
 		JLOG_DEBUG("Received application datagram");
 		if (agent->config.cb_recv)
-			agent->config.cb_recv(agent, buffer, len, agent->config.user_ptr);
+			agent->config.cb_recv(agent, buf, len, agent->config.user_ptr);
 		return 0;
 
 	case AGENT_STUN_ENTRY_TYPE_RELAY:
-		if (is_channel_data(buffer, len)) {
+		if (is_channel_data(buf, len)) {
 			JLOG_DEBUG("Received ChannelData datagram");
-			return agent_process_channel_data(agent, entry, buffer, len);
+			return agent_process_channel_data(agent, entry, buf, len);
 		}
 		break;
 
@@ -1083,7 +1090,7 @@ int agent_verify_credentials(juice_agent_t *agent, const agent_stun_entry_t *ent
 }
 
 int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_message_t *msg,
-                        const addr_record_t *source, const addr_record_t *relayed) {
+                        const addr_record_t *src, const addr_record_t *relayed) {
 	if (msg->msg_method == STUN_METHOD_BINDING && msg->has_integrity) {
 		JLOG_VERBOSE("STUN message is from the remote peer");
 		// Verify the message now
@@ -1093,7 +1100,7 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 		}
 		if (!relayed) {
 			if (agent_add_remote_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE,
-			                                         msg->priority, source)) {
+			                                         msg->priority, src)) {
 				JLOG_WARN("Failed to add remote peer reflexive candidate from STUN message");
 			}
 		}
@@ -1110,7 +1117,8 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 				break;
 			}
 			if (agent->entries[i].turn) {
-				if (turn_find_transaction_id(agent->entries[i].turn, msg->transaction_id, NULL)) {
+				if (turn_find_transaction_id(&agent->entries[i].turn->map, msg->transaction_id,
+				                             NULL)) {
 					entry = &agent->entries[i];
 					break;
 				}
@@ -1122,7 +1130,7 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 		}
 	} else {
 		JLOG_VERBOSE("STUN message is a request or indication, looking for remote address");
-		entry = agent_find_entry_from_record(agent, source, relayed);
+		entry = agent_find_entry_from_record(agent, src, relayed);
 		if (entry) {
 			JLOG_VERBOSE("Found STUN entry matching remote address");
 		} else {
@@ -1141,7 +1149,7 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
 			return -1;
 		}
-		return agent_process_stun_binding(agent, msg, entry, source, relayed);
+		return agent_process_stun_binding(agent, msg, entry, src, relayed);
 
 	case STUN_METHOD_ALLOCATE:
 	case STUN_METHOD_REFRESH:
@@ -1169,13 +1177,13 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 		return agent_process_turn_data(agent, msg, entry);
 
 	default:
-		JLOG_WARN("Unknown STUN method %X, ignoring", msg->msg_method);
+		JLOG_WARN("Unknown STUN method 0x%X, ignoring", msg->msg_method);
 		return -1;
 	}
 }
 
 int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
-                               agent_stun_entry_t *entry, const addr_record_t *source,
+                               agent_stun_entry_t *entry, const addr_record_t *src,
                                const addr_record_t *relayed) {
 	switch (msg->msg_class) {
 	case STUN_CLASS_REQUEST: {
@@ -1251,7 +1259,7 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 			}
 		}
 		if (agent_send_stun_binding(agent, entry, STUN_CLASS_RESP_SUCCESS, 0, msg->transaction_id,
-		                            source)) {
+		                            src)) {
 			JLOG_ERROR("Failed to send STUN Binding response");
 			return -1;
 		}
@@ -1259,7 +1267,7 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 	}
 	case STUN_CLASS_RESP_SUCCESS: {
 		JLOG_DEBUG("Received STUN Binding success response from %s",
-		           entry->type == AGENT_STUN_ENTRY_TYPE_CHECK ? "client" : "server");
+		           entry->type == AGENT_STUN_ENTRY_TYPE_CHECK ? "peer" : "server");
 
 		if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER)
 			JLOG_INFO("STUN server binding successful");
@@ -1361,14 +1369,17 @@ int agent_send_stun_binding(juice_agent_t *agent, const agent_stun_entry_t *entr
 	               ? "request"
 	               : (msg_class == STUN_CLASS_INDICATION ? "indication" : "response"));
 
-	if (!transaction_id)
-		transaction_id = entry->transaction_id;
-
 	stun_message_t msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_class = msg_class;
 	msg.msg_method = STUN_METHOD_BINDING;
-	memcpy(msg.transaction_id, transaction_id, STUN_TRANSACTION_ID_SIZE);
+
+	if (transaction_id)
+		memcpy(msg.transaction_id, transaction_id, STUN_TRANSACTION_ID_SIZE);
+	else if (msg_class == STUN_CLASS_INDICATION)
+		juice_random(msg.transaction_id, STUN_TRANSACTION_ID_SIZE);
+	else
+		memcpy(msg.transaction_id, entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
 
 	const char *password = NULL;
 	if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK) {
@@ -1465,9 +1476,15 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 		JLOG_DEBUG("Received TURN %s success response",
 		           msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh");
 
-		// There is nothing to do if this was a refresh
-		if(msg->msg_method == STUN_METHOD_REFRESH)
+		if (msg->msg_method == STUN_METHOD_REFRESH) {
+			JLOG_DEBUG("TURN refresh successful");
+			// There is nothing to do other than rearm
+			if (entry->state == AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
+				juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
+				agent_arm_transmission(agent, entry, TURN_REFRESH_PERIOD);
+			}
 			break;
+		}
 
 		JLOG_INFO("TURN allocation successful");
 		if (entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
@@ -1476,9 +1493,10 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 		}
 
 		if (!agent->selected_pair || !agent->selected_pair->nominated) {
-			// We want to send keepalives now
+			// We want to send refresh requests now
 			entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE;
-			agent_arm_transmission(agent, entry, STUN_KEEPALIVE_PERIOD);
+			juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
+			agent_arm_transmission(agent, entry, TURN_REFRESH_PERIOD);
 		}
 
 		if (msg->mapped.len) {
@@ -1509,7 +1527,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 		if (msg->error_code == 401) { // Unauthorized
 			JLOG_DEBUG("Got TURN %s Unauthorized response",
 			           msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh");
-			if(*entry->turn->credentials.realm != '\0') {
+			if (*entry->turn->credentials.realm != '\0') {
 				JLOG_ERROR("TURN authentication failed");
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 				return -1;
@@ -1525,8 +1543,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 
 			// Resend request when possible
 			agent_arm_transmission(agent, entry, 0);
-		}
-		else if (msg->error_code == 438) { // Stale Nonce
+		} else if (msg->error_code == 438) { // Stale Nonce
 			JLOG_DEBUG("Got TURN %s Stale Nonce response",
 			           msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh");
 			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
@@ -1625,7 +1642,9 @@ int agent_process_turn_create_permission(juice_agent_t *agent, const stun_messag
 	switch (msg->msg_class) {
 	case STUN_CLASS_RESP_SUCCESS: {
 		JLOG_DEBUG("Received TURN CreatePermission success response");
-		turn_set_permission(entry->turn, msg->transaction_id);
+		if (!turn_set_permission(&entry->turn->map, msg->transaction_id, NULL,
+		                         PERMISSION_LIFETIME / 2))
+			JLOG_WARN("Transaction ID from TURN CreatePermission response does not match");
 		break;
 	}
 	case STUN_CLASS_RESP_ERROR: {
@@ -1672,7 +1691,7 @@ int agent_send_turn_create_permission_request(juice_agent_t *agent, agent_stun_e
 	strcpy(msg.credentials.realm, credentials->realm);
 	strcpy(msg.credentials.nonce, credentials->nonce);
 
-	turn_new_transaction_id(entry->turn, record, msg.transaction_id);
+	turn_set_random_permission_transaction_id(&entry->turn->map, record, msg.transaction_id);
 
 	char buffer[BUFFER_SIZE];
 	int size = stun_write(buffer, BUFFER_SIZE, &msg, password);
@@ -1702,7 +1721,9 @@ int agent_process_turn_channel_bind(juice_agent_t *agent, const stun_message_t *
 	switch (msg->msg_class) {
 	case STUN_CLASS_RESP_SUCCESS: {
 		JLOG_DEBUG("Received TURN ChannelBind success response");
-		turn_set_bind(entry->turn, msg->transaction_id);
+		if (!turn_bind_current_channel(&entry->turn->map, msg->transaction_id, NULL,
+		                               BIND_LIFETIME / 2))
+			JLOG_WARN("Transaction ID from TURN ChannelBind response does not match");
 		break;
 	}
 	case STUN_CLASS_RESP_ERROR: {
@@ -1739,8 +1760,9 @@ int agent_send_turn_channel_bind_request(juice_agent_t *agent, agent_stun_entry_
 	}
 
 	uint16_t channel;
-	if (!turn_get_channel(entry->turn, record, &channel))
-		return -1;
+	if (!turn_get_channel(&entry->turn->map, record, &channel))
+		if (!turn_bind_random_channel(&entry->turn->map, record, &channel, 0))
+			return -1;
 
 	stun_message_t msg;
 	memset(&msg, 0, sizeof(msg));
@@ -1753,7 +1775,7 @@ int agent_send_turn_channel_bind_request(juice_agent_t *agent, agent_stun_entry_
 	strcpy(msg.credentials.realm, credentials->realm);
 	strcpy(msg.credentials.nonce, credentials->nonce);
 
-	if (!turn_new_transaction_id(entry->turn, record, msg.transaction_id))
+	if (!turn_set_random_channel_transaction_id(&entry->turn->map, record, msg.transaction_id))
 		return -1;
 
 	char buffer[BUFFER_SIZE];
@@ -1792,15 +1814,15 @@ int agent_process_turn_data(juice_agent_t *agent, const stun_message_t *msg,
 	return agent_input(agent, (char *)msg->data, msg->data_size, &msg->peer, &entry->relayed);
 }
 
-int agent_process_channel_data(juice_agent_t *agent, agent_stun_entry_t *entry, char *buffer,
+int agent_process_channel_data(juice_agent_t *agent, agent_stun_entry_t *entry, char *buf,
                                size_t len) {
 	if (len < sizeof(struct channel_data_header)) {
 		JLOG_WARN("ChannelData is too short");
 		return -1;
 	}
 
-	const struct channel_data_header *header = (const struct channel_data_header *)buffer;
-	buffer += sizeof(struct channel_data_header);
+	const struct channel_data_header *header = (const struct channel_data_header *)buf;
+	buf += sizeof(struct channel_data_header);
 	len -= sizeof(struct channel_data_header);
 	uint16_t channel = ntohs(header->channel_number);
 	uint16_t length = ntohs(header->length);
@@ -1810,13 +1832,13 @@ int agent_process_channel_data(juice_agent_t *agent, agent_stun_entry_t *entry, 
 		return -1;
 	}
 
-	addr_record_t source;
-	if (!turn_find_channel(entry->turn, channel, &source)) {
+	addr_record_t src;
+	if (!turn_find_channel(&entry->turn->map, channel, &src)) {
 		JLOG_WARN("Channel not found");
 		return -1;
 	}
 
-	return agent_input(agent, buffer, length, &source, &entry->relayed);
+	return agent_input(agent, buf, length, &src, &entry->relayed);
 }
 
 int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t *record) {
